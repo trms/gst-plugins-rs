@@ -3199,3 +3199,218 @@ fn test_caps_change_before_first_frame() {
 
     assert_eq!(h.buffers_in_queue(), 0);
 }
+
+#[track_caller]
+fn test_average_fragment_duration_push(h: &mut gst_check::Harness, num_bufs: u64, offset: u64) {
+    for i in 0..num_bufs {
+        let mut buffer = gst::Buffer::with_size(1).unwrap();
+        {
+            let buffer = buffer.get_mut().unwrap();
+            let pos = i + offset;
+            buffer.set_pts(pos.seconds());
+            buffer.set_dts(pos.seconds());
+            buffer.set_duration(gst::ClockTime::SECOND);
+            if i != 0 {
+                buffer.set_flags(gst::BufferFlags::DELTA_UNIT);
+            }
+        }
+        assert_eq!(h.push(buffer), Ok(gst::FlowSuccess::Ok));
+        if i == 2 && offset == 0 {
+            // Waits for clock so that muxer can prepare initial fku event
+            h.crank_single_clock_wait().unwrap();
+        }
+    }
+}
+
+#[test]
+fn test_average_fragment_duration_fku() {
+    init();
+
+    let mut h = gst_check::Harness::new("cmafmux");
+
+    let caps = gst::Caps::builder("video/x-h264")
+        .field("width", 1920i32)
+        .field("height", 1080i32)
+        .field("framerate", gst::Fraction::new(1, 1))
+        .field("stream-format", "avc")
+        .field("alignment", "au")
+        .field("codec_data", gst::Buffer::with_size(1).unwrap())
+        .build();
+
+    // Configures 5s fragment-duration with allowed diff 1s
+    h.element()
+        .unwrap()
+        .set_property("fragment-duration", 5.seconds());
+    h.element()
+        .unwrap()
+        .set_property("max-fragment-duration-diff", 1.seconds());
+    h.element()
+        .unwrap()
+        .set_property_from_str("fragment-duration-mode", "average");
+
+    h.set_src_caps(caps);
+    h.play();
+
+    // Push first fragment, GOP size is 3s
+    let mut current = 0u64;
+    let segment_dur_list: Vec<u64> = vec![8, 3, 3, 6];
+    let fku_event_list = vec![
+        // start_time: 0s
+        // ideal_target_time: 5s (fragment-duration * 1)
+        // allowed_range: [4s, 6s]
+        // ideal_target_time is in allowed_range.
+        // muxer will request keyframe at ideal_target_time
+        gst_video::UpstreamForceKeyUnitEvent {
+            running_time: Some(5.seconds()),
+            all_headers: true,
+            count: 0,
+        },
+        // start_time: 8s
+        // ideal_target_time: 10s (fragment-duration * 2)
+        // allowed_range: [12s, 14s]
+        // ideal_target_time is smaller than allowed min.
+        // muxer will request keyframe at allowed min
+        gst_video::UpstreamForceKeyUnitEvent {
+            running_time: Some(12.seconds()),
+            all_headers: true,
+            count: 0,
+        },
+        // start_time: 11s
+        // ideal_target_time: 15s (fragment-duration * 3)
+        // allowed_range: [15s, 17s]
+        // ideal_target_time is in allowed_range.
+        // muxer will request keyframe at ideal_target_time
+        gst_video::UpstreamForceKeyUnitEvent {
+            running_time: Some(15.seconds()),
+            all_headers: true,
+            count: 0,
+        },
+        // start_time: 14s
+        // ideal_target_time: 20s (fragment-duration * 4)
+        // allowed_range: [18s, 20s]
+        // ideal_target_time is in allowed_range.
+        // muxer will request keyframe at ideal_target_time
+        gst_video::UpstreamForceKeyUnitEvent {
+            running_time: Some(20.seconds()),
+            all_headers: true,
+            count: 0,
+        },
+    ];
+
+    for i in &segment_dur_list {
+        test_average_fragment_duration_push(&mut h, *i, current);
+        h.crank_single_clock_wait().unwrap();
+        current += *i;
+    }
+
+    h.push_event(gst::event::Eos::new());
+
+    let header = h.pull().unwrap();
+    assert_eq!(
+        header.flags(),
+        gst::BufferFlags::HEADER | gst::BufferFlags::DISCONT
+    );
+    assert_eq!(header.pts(), Some(gst::ClockTime::ZERO));
+    assert_eq!(header.dts(), Some(gst::ClockTime::ZERO));
+
+    for frag in 0..segment_dur_list.len() {
+        let fragment_header = h.pull().unwrap();
+        let expected = segment_dur_list[frag];
+        assert_eq!(fragment_header.duration(), Some(expected.seconds()));
+        for _ in 0..expected {
+            let data = h.pull().unwrap();
+            assert_eq!(data.duration(), Some(1.seconds()));
+        }
+    }
+
+    for expected in &fku_event_list {
+        let ev = loop {
+            let ev = h.pull_upstream_event().unwrap();
+            if ev.type_() != gst::EventType::Reconfigure && ev.type_() != gst::EventType::Latency {
+                break ev;
+            }
+        };
+
+        assert_eq!(
+            gst_video::UpstreamForceKeyUnitEvent::parse(&ev).unwrap(),
+            *expected
+        );
+    }
+}
+
+#[test]
+fn test_average_fragment_duration_audio() {
+    init();
+
+    let mut h = gst_check::Harness::new("cmafmux");
+
+    let caps = gst::Caps::builder("audio/mpeg")
+        .field("mpegversion", 4i32)
+        .field("channels", 1i32)
+        .field("rate", 44100i32)
+        .field("stream-format", "raw")
+        .field("base-profile", "lc")
+        .field("profile", "lc")
+        .field("level", "2")
+        .field(
+            "codec_data",
+            gst::Buffer::from_slice([0x12, 0x08, 0x56, 0xe5, 0x00]),
+        )
+        .build();
+
+    // Configures 2s fragment-duration with allowed max diff 500ms
+    h.element()
+        .unwrap()
+        .set_property("fragment-duration", 2.seconds());
+    h.element()
+        .unwrap()
+        .set_property("max-fragment-duration-diff", 500.mseconds());
+    h.element()
+        .unwrap()
+        .set_property_from_str("fragment-duration-mode", "average");
+
+    h.set_src_caps(caps);
+    h.play();
+
+    // fragment-duration-mode=average will allow temporary duration overshoot
+    let expected_dur_list: Vec<u64> = vec![
+        6, // 1.8s
+        7, // 2.1s, accumulated dur 3.9s
+        7, // 2.1s, accumulated dur 6s
+        6, // 1.8s, accumulated dur 7.8s
+    ];
+
+    let num_bufs = expected_dur_list.iter().map(|&i| i).sum();
+    for i in 0..num_bufs {
+        let mut buffer = gst::Buffer::with_size(1).unwrap();
+        {
+            let buffer = buffer.get_mut().unwrap();
+            let pos = 300.mseconds() * i;
+            buffer.set_pts(pos);
+            buffer.set_dts(pos);
+            buffer.set_duration(300.mseconds());
+        }
+
+        assert_eq!(h.push(buffer), Ok(gst::FlowSuccess::Ok));
+    }
+
+    h.push_event(gst::event::Eos::new());
+
+    let header = h.pull().unwrap();
+    assert_eq!(
+        header.flags(),
+        gst::BufferFlags::HEADER | gst::BufferFlags::DISCONT
+    );
+    assert_eq!(header.pts(), Some(gst::ClockTime::ZERO));
+
+    for frag in 0..expected_dur_list.len() {
+        let fragment_header = h.pull().unwrap();
+        let expected = expected_dur_list[frag];
+        let expected_dur = 300.mseconds() * expected;
+        assert_eq!(fragment_header.duration(), Some(expected_dur));
+        for _ in 0..expected {
+            let data = h.pull().unwrap();
+            assert_eq!(data.duration(), Some(300.mseconds()));
+        }
+    }
+}
