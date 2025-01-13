@@ -335,3 +335,11 @@ pub(crate) enum WriteEdtsMode {
     Always,
     Never,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, glib::Enum, Default)]
+#[enum_type(name = "GstFMP4MuxFragmentDurationMode")]
+pub(crate) enum FragmentDurationMode {
+    #[default]
+    Strict,
+    Average,
+}

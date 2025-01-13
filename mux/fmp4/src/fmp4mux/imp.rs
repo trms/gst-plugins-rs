@@ -26,6 +26,7 @@ use std::sync::LazyLock;
 use super::boxes;
 use super::Buffer;
 use super::DeltaFrames;
+use super::FragmentDurationMode;
 use super::WriteEdtsMode;
 
 /// Offset for the segment in non-single-stream variants.
@@ -111,6 +112,8 @@ const DEFAULT_WRITE_MEHD: bool = false;
 const DEFAULT_INTERLEAVE_BYTES: Option<u64> = None;
 const DEFAULT_INTERLEAVE_TIME: Option<gst::ClockTime> = Some(gst::ClockTime::from_mseconds(250));
 const DEFAULT_WRITE_EDTS_MODE: WriteEdtsMode = WriteEdtsMode::Auto;
+const DEFAULT_FRAGMENT_DURATION_MODE: FragmentDurationMode = FragmentDurationMode::Strict;
+const DEFAULT_MAX_FRAGMENT_DURATION_DIFF: gst::ClockTime = gst::ClockTime::ZERO;
 
 #[derive(Debug, Clone)]
 struct Settings {
@@ -124,6 +127,8 @@ struct Settings {
     movie_timescale: u32,
     offset_to_zero: bool,
     write_edts_mode: WriteEdtsMode,
+    fragment_duration_mode: FragmentDurationMode,
+    max_fragment_duration_diff: gst::ClockTime,
 }
 
 impl Default for Settings {
@@ -139,6 +144,8 @@ impl Default for Settings {
             movie_timescale: 0,
             offset_to_zero: false,
             write_edts_mode: DEFAULT_WRITE_EDTS_MODE,
+            fragment_duration_mode: DEFAULT_FRAGMENT_DURATION_MODE,
+            max_fragment_duration_diff: DEFAULT_MAX_FRAGMENT_DURATION_DIFF,
         }
     }
 }
@@ -384,7 +391,7 @@ struct State {
     need_new_header: bool,
 
     /// Sequence number of the current fragment.
-    sequence_number: u32,
+    sequence_number: u64,
 
     /// Fragment tracking for mfra box
     current_offset: u64,
@@ -1366,8 +1373,37 @@ impl FMP4Mux {
         manual_fragment_boundaries: &BTreeSet<gst::ClockTime>,
         settings: &Settings,
         fragment_start_pts: gst::ClockTime,
+        earliest_pts: gst::ClockTime,
+        sequence_number: u64,
     ) -> gst::ClockTime {
-        let fragment_end_pts = fragment_start_pts + settings.fragment_duration;
+        let mut fragment_end_pts = fragment_start_pts + settings.fragment_duration;
+        if settings.fragment_duration_mode == FragmentDurationMode::Average
+            && !settings.max_fragment_duration_diff.is_zero()
+        {
+            // Ideal target fragment end time
+            let target = earliest_pts + settings.fragment_duration * sequence_number;
+
+            let range_max = fragment_end_pts + settings.max_fragment_duration_diff;
+            let mut range_min =
+                fragment_end_pts.saturating_sub(settings.max_fragment_duration_diff);
+            if range_min <= fragment_start_pts {
+                // Makes fragment end time larger than start time at least,
+                // can happen if max_fragment_duration_diff is larger than fragment duration
+                range_min = fragment_start_pts + gst::ClockTime::from_nseconds(1);
+            }
+
+            if range_min <= target && range_max >= target {
+                fragment_end_pts = target;
+            } else if target < range_min {
+                fragment_end_pts = range_min;
+            } else {
+                fragment_end_pts = range_max;
+            }
+            gst::log!(CAT,
+                imp = self,
+                "Calculated fragment end pts, start {}, allowed-range [{}, {}], ideal-target {}, final {}",
+                fragment_start_pts, range_min, range_max, target, fragment_end_pts);
+        }
 
         // If we have a manual fragment boundary set then use that
         *manual_fragment_boundaries
@@ -1704,8 +1740,13 @@ impl FMP4Mux {
         );
 
         let fragment_start_pts = earliest_pts;
-        let fragment_end_pts =
-            self.get_fragment_end_pts(&state.manual_fragment_boundaries, settings, earliest_pts);
+        let fragment_end_pts = self.get_fragment_end_pts(
+            &state.manual_fragment_boundaries,
+            settings,
+            earliest_pts,
+            earliest_pts,
+            1,
+        );
         let chunk_start_pts = earliest_pts;
 
         state.earliest_pts = Some(earliest_pts);
@@ -2760,7 +2801,7 @@ impl FMP4Mux {
         let (mut fmp4_fragment_header, moof_offset) =
             boxes::create_fmp4_fragment_header(super::FragmentHeaderConfiguration {
                 variant: self.obj().class().as_ref().variant,
-                sequence_number,
+                sequence_number: sequence_number as u32,
                 chunk: !fragment_start,
                 streams: streams.as_slice(),
                 buffers: interleaved_buffers.as_slice(),
@@ -2846,6 +2887,8 @@ impl FMP4Mux {
                 &state.manual_fragment_boundaries,
                 settings,
                 chunk_end_pts,
+                state.earliest_pts.unwrap(),
+                state.sequence_number,
             ));
             gst::info!(
                 CAT,
@@ -3426,6 +3469,21 @@ impl ObjectImpl for FMP4Mux {
                     .blurb("Mode for writing EDTS, when in auto mode, edts written only for non-live streams.")
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecEnum::builder_with_default("fragment-duration-mode", DEFAULT_FRAGMENT_DURATION_MODE)
+                    .nick("Fragment Duration Mode")
+                    .blurb("Mode for fragment boundary decision with given fragment duration. \
+                           'average' mode with nonzero 'max-fragment-duration-diff' \
+                           will allow temporary fragment duration overshoot so that \
+                           average fragment duration can be as close as configured 'fragment-duration'")
+                    .mutable_ready()
+                    .build(),
+                glib::ParamSpecUInt64::builder("max-fragment-duration-diff")
+                    .nick("Max Fragment Duration Diff")
+                    .blurb("Allowed maximum fragment duration differences between 'fragment-duration' and \
+                           calculated fragment duration in nanoseconds")
+                    .default_value(DEFAULT_MAX_FRAGMENT_DURATION_DIFF.nseconds())
+                    .mutable_ready()
+                    .build(),
             ]
         });
 
@@ -3495,10 +3553,22 @@ impl ObjectImpl for FMP4Mux {
                 let mut settings = self.settings.lock().unwrap();
                 settings.movie_timescale = value.get().expect("type checked upstream");
             }
+
             "write-edts-mode" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.write_edts_mode = value.get().expect("type checked upstream");
             }
+
+            "fragment-duration-mode" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.fragment_duration_mode = value.get().expect("type checked upstream");
+            }
+
+            "max-fragment-duration-diff" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.max_fragment_duration_diff = value.get().expect("type checked upstream");
+            }
+
             _ => unimplemented!(),
         }
     }
@@ -3544,9 +3614,20 @@ impl ObjectImpl for FMP4Mux {
                 let settings = self.settings.lock().unwrap();
                 settings.movie_timescale.to_value()
             }
+
             "write-edts-mode" => {
                 let settings = self.settings.lock().unwrap();
                 settings.write_edts_mode.to_value()
+            }
+
+            "fragment-duration-mode" => {
+                let settings = self.settings.lock().unwrap();
+                settings.fragment_duration_mode.to_value()
+            }
+
+            "max-fragment-duration-diff" => {
+                let settings = self.settings.lock().unwrap();
+                settings.max_fragment_duration_diff.to_value()
             }
 
             _ => unimplemented!(),
