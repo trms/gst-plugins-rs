@@ -188,7 +188,7 @@ impl TranscriberStream {
                 .recv()
                 .await
                 .map_err(|err| {
-                    let err = format!("Transcribe ws stream error: {err}: {}", err.meta());
+                    let err = format!("Transcribe ws stream error: {err}: {:?}", err.meta());
                     gst::error!(CAT, imp: self.imp, "{err}");
                     gst::error_msg!(gst::LibraryError::Failed, ["{err}"])
                 })?;
