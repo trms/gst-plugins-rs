@@ -595,7 +595,7 @@ impl Translate {
         }
 
         let mut message_builder = gst::Structure::builder("awstranslate/raw")
-            .field("translation", translated_items_builder.build())
+            .field("translation", &translated_items_builder.build())
             .field("arrival-time", self.obj().current_running_time())
             .field("start-time", to_translate.start_pts())
             .field("language-code", &output_lang);
