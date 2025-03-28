@@ -70,6 +70,8 @@ struct InputItem {
     end_pts: gst::ClockTime,
     is_punctuation: bool,
     discont: bool,
+    awstranscribe_item: Option<String>,
+    speechmatics_items: Option<Vec<String>>,
 }
 
 #[derive(Debug)]
@@ -484,6 +486,11 @@ impl Translate {
         let mut content: Vec<String> = vec![];
         let mut it = to_translate.0.iter().peekable();
 
+        let items: [String; 0] = [];
+        let mut original_aws_items = gst::List::new(items);
+        let items: [String; 0] = [];
+        let mut original_speechmatics_items = gst::List::new(items);
+
         while let Some(item) = it.next() {
             let suffix = match it.peek() {
                 Some(next_item) => {
@@ -502,6 +509,16 @@ impl Translate {
                     format!("{SPAN_START}{}{SPAN_END}{}", item.content, suffix)
                 }
             });
+
+            if let Some(ref original_item) = item.awstranscribe_item {
+                original_aws_items.append(original_item.to_send_value());
+            }
+
+            if let Some(ref original_items) = item.speechmatics_items {
+                for original_item in original_items {
+                    original_speechmatics_items.append(original_item.to_send_value());
+                }
+            }
         }
 
         let content: String = content.join("");
@@ -602,6 +619,16 @@ impl Translate {
 
         if let Some(speaker) = speaker {
             message_builder = message_builder.field("speaker", speaker);
+        }
+
+        if !original_aws_items.is_empty() {
+            message_builder =
+                message_builder.field("original-awstranscribe-items", original_aws_items);
+        }
+
+        if !original_speechmatics_items.is_empty() {
+            message_builder =
+                message_builder.field("original-speechmatics-items", original_speechmatics_items);
         }
 
         let _ = self.obj().post_message(
@@ -745,6 +772,16 @@ impl Translate {
             gst::FlowError::Error
         })?;
 
+        let original_aws_item: Option<String> =
+            gst::meta::CustomMeta::from_buffer(&buffer, "AWSTranscribeItemMeta")
+                .ok()
+                .and_then(|m| m.structure().get::<String>("item").ok());
+
+        let original_speechmatics_items: Option<Vec<String>> =
+            gst::meta::CustomMeta::from_buffer(&buffer, "SpeechmaticsItemMeta")
+                .ok()
+                .and_then(|m| m.structure().get::<Vec<String>>("items").ok());
+
         let drained_items = if buffer.flags().contains(gst::BufferFlags::DISCONT) {
             let items = self.drain(false);
 
@@ -798,6 +835,8 @@ impl Translate {
                 end_pts,
                 is_punctuation,
                 discont,
+                awstranscribe_item: original_aws_item,
+                speechmatics_items: original_speechmatics_items,
             };
 
             if let Some(accumulator) = state.accumulator.as_mut() {
