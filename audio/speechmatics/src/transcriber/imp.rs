@@ -9,6 +9,7 @@
 use gst::subclass::prelude::*;
 use gst::{glib, prelude::*};
 
+
 use std::default::Default;
 
 use async_tungstenite::tungstenite::error::Error as WsError;
@@ -125,6 +126,13 @@ struct Vocable {
     sounds_like: Vec<String>,
 }
 
+#[derive(serde::Serialize, Debug, Clone)]
+struct Speaker {
+    label: String,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    speaker_identifiers: Vec<String>,
+}
+
 #[derive(serde::Serialize, Debug)]
 #[serde(rename_all = "lowercase")]
 enum Diarization {
@@ -145,6 +153,8 @@ impl From<SpeechmaticsTranscriberDiarization> for Diarization {
 #[derive(serde::Serialize, Debug)]
 struct SpeakerDiarizationConfig {
     max_speakers: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    speakers: Option<Vec<Speaker>>,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -217,6 +227,7 @@ struct Settings {
     diarization: SpeechmaticsTranscriberDiarization,
     max_speakers: u32,
     mask_profanities: bool,
+    speakers: Vec<Speaker>,
 }
 
 impl Default for Settings {
@@ -233,6 +244,7 @@ impl Default for Settings {
             diarization: DEFAULT_DIARIZATION,
             max_speakers: DEFAULT_MAX_SPEAKERS,
             mask_profanities: DEFAULT_MASK_PROFANITIES,
+            speakers: Vec::new(),
         }
     }
 }
@@ -1409,6 +1421,11 @@ impl Transcriber {
                 diarization: settings.diarization.into(),
                 speaker_diarization_config: SpeakerDiarizationConfig {
                     max_speakers: settings.max_speakers,
+                    speakers: if settings.speakers.is_empty() {
+                        None
+                    } else {
+                        Some(settings.speakers.clone())
+                    },
                 },
             },
             translation_config: TranslationConfig {
@@ -1420,6 +1437,7 @@ impl Transcriber {
         let message = serde_json::to_string(&start_message).unwrap();
 
         gst::debug!(CAT, imp = self, "Sending start message: {}", message);
+        //println!("Sending start message: {}", message);
 
         RUNTIME
             .block_on(ws_sink.send(Message::text(message)))
@@ -1453,11 +1471,13 @@ impl Transcriber {
             let text = match res {
                 Message::Text(text) => Ok(text),
                 _ => {
-                    gst::error!(CAT, imp = self, "Invalid message type: {}", res);
-                    Err(gst::error_msg!(
-                        gst::CoreError::Failed,
-                        ["Invalid message type: {}", res]
-                    ))
+                    gst::debug!(CAT, imp = self, "Ignoring non-text message: {:?}", res);
+                    continue;
+                    // gst::error!(CAT, imp = self, "Invalid message type: {:?}", res);
+                    // Err(gst::error_msg!(
+                    //     gst::CoreError::Failed,
+                    //     ["Invalid message type: {:?}", res]
+                    // ))
                 }
             }?;
 
@@ -1767,6 +1787,17 @@ impl ObjectImpl for Transcriber {
                     .default_value(DEFAULT_MASK_PROFANITIES)
                     .mutable_ready()
                     .build(),
+                gst::ParamSpecArray::builder("speakers")
+                    .nick("Speakers")
+                    .blurb("Map of speaker labels to arrays of identifier strings")
+                    .element_spec(
+                        &glib::ParamSpecBoxed::builder::<gst::Structure>("speaker")
+                            .nick("Speaker")
+                            .blurb("A speaker in the audio")
+                            .build(),
+                    )
+                    .mutable_ready()
+                    .build(),
             ]
         });
 
@@ -1873,8 +1904,17 @@ impl ObjectImpl for Transcriber {
                             .iter()
                             .filter_map(|s| s.get::<Option<String>>().unwrap_or(None))
                             .collect(),
-                        Err(_) => vec![],
+                        Err(error) => {
+                            gst::warning!(
+                                CAT,
+                                imp = self,
+                                "using empty vec for vocable: {s}, error extracting sounds_like field: {error}",
+                            );
+                            vec![]
+                        }
                     };
+
+                    //println!("Adding vocable: {} - sounds_like: {:?}", content, sounds_like);
 
                     state.additional_vocabulary.push(Vocable {
                         content,
@@ -1907,6 +1947,53 @@ impl ObjectImpl for Transcriber {
             "mask-profanities" => {
                 let mut settings = self.settings.lock().unwrap();
                 settings.mask_profanities = value.get().expect("type checked upstream");
+            }
+            "speakers" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.speakers.clear();
+                let vocables: gst::Array = value.get().expect("type checked upstream");
+                for vocable in vocables.as_slice() {
+                    let Some(s) = vocable
+                        .get::<Option<gst::Structure>>()
+                        .expect("type checked upstream")
+                    else {
+                        continue;
+                    };
+
+
+                    let label: String = match s.get::<String>("label") {
+                        Ok(label) => label,
+                        Err(_) => {
+                            gst::warning!(
+                                CAT,
+                                imp = self,
+                                "skipping speaker: {s}, expected label field",
+                            );
+                            continue;
+                        }
+                    };
+
+                    let speaker_identifiers: Vec<String> = match s.get::<gst::Array>("speaker_identifiers") {
+                        Ok(speaker_identifiers) => speaker_identifiers
+                            .as_slice()
+                            .iter()
+                            .filter_map(|s| s.get::<Option<String>>().unwrap_or(None))
+                            .collect(),
+                        Err(error) => {
+                            gst::warning!(
+                                CAT,
+                                imp = self,
+                                "using empty vec for speaker: {s}, error extracting sounds_like field: {error}",
+                            );
+                            vec![]
+                        }
+                    };
+
+                    settings.speakers.push(Speaker {
+                        label,
+                        speaker_identifiers,
+                    });
+                }
             }
             _ => unimplemented!(),
         }
@@ -1968,6 +2055,27 @@ impl ObjectImpl for Transcriber {
             "mask-profanities" => {
                 let settings = self.settings.lock().unwrap();
                 settings.mask_profanities.to_value()
+            }
+            "speakers" => {
+                let settings = self.settings.lock().unwrap();
+                let mut speakers = vec![];
+                for speaker in &settings.speakers {
+                    let mut s = gst::Structure::new_empty(&speaker.label);
+                    if !speaker.speaker_identifiers.is_empty() {
+                        s.set("label", &speaker.label.as_str());
+                        s.set(
+                            "speaker_identifiers",
+                            gst::Array::new(
+                                speaker
+                                    .speaker_identifiers
+                                    .iter()
+                                    .map(|word| word.to_send_value()),
+                            ),
+                        );
+                    }
+                    speakers.push(s.to_send_value());
+                }
+                gst::Array::new(speakers).to_value()
             }
             _ => unimplemented!(),
         }
