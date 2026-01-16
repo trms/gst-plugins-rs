@@ -26,6 +26,7 @@ use crate::isobmff::ChnlLayoutInfo;
 use crate::isobmff::ChunkMode;
 use crate::isobmff::DeltaFrames;
 use crate::isobmff::ElstInfo;
+use crate::isobmff::FragmentDurationMode;
 use crate::isobmff::FragmentHeaderConfiguration;
 use crate::isobmff::FragmentHeaderStream;
 use crate::isobmff::FragmentOffset;
@@ -159,6 +160,8 @@ const DEFAULT_DECODE_TIME_OFFSET: gst::ClockTimeDiff = 0;
 const DEFAULT_START_FRAGMENT_SEQUENCE_NUMBER: u32 = 1;
 const DEFAULT_ENABLE_KEYFRAME_META: bool = false;
 const DEFAULT_CHUNK_MODE: ChunkMode = ChunkMode::None;
+const DEFAULT_FRAGMENT_DURATION_MODE: FragmentDurationMode = FragmentDurationMode::Strict;
+const DEFAULT_MAX_FRAGMENT_DURATION_DIFF: gst::ClockTime = gst::ClockTime::ZERO;
 
 #[derive(Debug, Clone)]
 struct Settings {
@@ -178,6 +181,8 @@ struct Settings {
     start_fragment_sequence_number: u32,
     enable_keyframe_meta: bool,
     chunk_mode: ChunkMode,
+    fragment_duration_mode: FragmentDurationMode,
+    max_fragment_duration_diff: gst::ClockTime,
 }
 
 impl Default for Settings {
@@ -199,6 +204,8 @@ impl Default for Settings {
             start_fragment_sequence_number: DEFAULT_START_FRAGMENT_SEQUENCE_NUMBER,
             enable_keyframe_meta: DEFAULT_ENABLE_KEYFRAME_META,
             chunk_mode: DEFAULT_CHUNK_MODE,
+            fragment_duration_mode: DEFAULT_FRAGMENT_DURATION_MODE,
+            max_fragment_duration_diff: DEFAULT_MAX_FRAGMENT_DURATION_DIFF,
         }
     }
 }
@@ -469,7 +476,7 @@ struct State {
     need_new_header: bool,
 
     /// Sequence number of the current fragment.
-    sequence_number: u32,
+    sequence_number: u64,
 
     /// Fragment tracking for mfra box
     current_offset: u64,
@@ -1962,7 +1969,51 @@ impl FMP4Mux {
             let _ = state.pending_split_at_running_time_requests.pop_first();
         }
 
-        let scheduled_fragment_end_pts = fragment_start_pts + settings.fragment_duration;
+        let mut scheduled_fragment_end_pts = fragment_start_pts + settings.fragment_duration;
+
+        if settings.fragment_duration_mode == FragmentDurationMode::Average
+            && !settings.max_fragment_duration_diff.is_zero()
+        {
+            let sequence =
+                state.sequence_number - settings.start_fragment_sequence_number as u64 + 1;
+            let earliest_pts = if let Some(earliest) = state.earliest_pts {
+                earliest
+            } else {
+                fragment_start_pts
+            };
+
+            let target = earliest_pts + settings.fragment_duration * sequence;
+
+            let range_max = scheduled_fragment_end_pts + settings.max_fragment_duration_diff;
+            let mut range_min =
+                scheduled_fragment_end_pts.saturating_sub(settings.max_fragment_duration_diff);
+            if range_min <= fragment_start_pts {
+                // Makes fragment end time larger than start time at least,
+                // can happen if max_fragment_duration_diff is larger than fragment duration
+                range_min = fragment_start_pts + gst::ClockTime::from_nseconds(1);
+            }
+
+            if range_min <= target && range_max >= target {
+                scheduled_fragment_end_pts = target;
+            } else if target < range_min {
+                scheduled_fragment_end_pts = range_min;
+            } else {
+                scheduled_fragment_end_pts = range_max;
+            }
+
+            gst::log!(
+                CAT,
+                imp = self,
+                "Calculated fragment end pts, sequence {} start {}, allowed-range [{}, {}], ideal-target {}, final {}",
+                sequence,
+                fragment_start_pts,
+                range_min,
+                range_max,
+                target,
+                scheduled_fragment_end_pts
+            );
+        }
+
         let earliest_requested_fragment_end_pts = state
             .pending_split_at_running_time_requests
             .range((Bound::Excluded(fragment_start_pts), Bound::Unbounded))
@@ -3340,7 +3391,7 @@ impl FMP4Mux {
         let (mut fmp4_fragment_header, moof_offset) =
             create_fmp4_fragment_header(FragmentHeaderConfiguration {
                 variant: self.obj().class().as_ref().variant,
-                sequence_number,
+                sequence_number: sequence_number as u32,
                 chunk: !fragment_start,
                 streams: streams.as_slice(),
                 buffers: interleaved_buffers.as_slice(),
@@ -3361,7 +3412,7 @@ impl FMP4Mux {
             buffer.set_pts(min_earliest_pts_position);
             buffer.set_dts(min_start_dts_position);
             buffer.set_duration(chunk_end_pts.checked_sub(chunk_start_pts));
-            buffer.set_offset(sequence_number as u64);
+            buffer.set_offset(sequence_number);
             buffer.set_offset_end(u64::MAX);
 
             // Fragment and chunk header is HEADER
@@ -4381,6 +4432,37 @@ impl ObjectImpl for FMP4Mux {
                     .blurb("Mode to control chunking on key frame or duration")
                     .mutable_ready()
                     .build(),
+
+                /**
+                 * GstFMP4Mux:fragment-duration-mode:
+                 *
+                 * Mode for fragment boundary decision with given fragment duration.
+                 *
+                 * Since: plugins-rs-0.15.0
+                 */
+                glib::ParamSpecEnum::builder_with_default("fragment-duration-mode", DEFAULT_FRAGMENT_DURATION_MODE)
+                    .nick("Fragment Duration Mode")
+                    .blurb("Mode for fragment boundary decision with given fragment duration. \
+                           'average' mode with nonzero 'max-fragment-duration-diff' \
+                           will allow temporary fragment duration overshoot so that \
+                           average fragment duration can be as close as configured 'fragment-duration'")
+                    .mutable_ready()
+                    .build(),
+
+                /**
+                 * GstFMP4Mux:max-fragment-duration-diff:
+                 *
+                 * Allowed maximum fragment duration differences.
+                 *
+                 * Since: plugins-rs-0.15.0
+                 */
+                glib::ParamSpecUInt64::builder("max-fragment-duration-diff")
+                    .nick("Max Fragment Duration Diff")
+                    .blurb("Allowed maximum fragment duration differences between 'fragment-duration' and \
+                           calculated fragment duration in nanoseconds")
+                    .default_value(DEFAULT_MAX_FRAGMENT_DURATION_DIFF.nseconds())
+                    .mutable_ready()
+                    .build(),
             ]
         });
 
@@ -4480,6 +4562,14 @@ impl ObjectImpl for FMP4Mux {
                 let mut settings = self.settings.lock().unwrap();
                 settings.chunk_mode = value.get().expect("type checked upstream");
             }
+            "fragment-duration-mode" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.fragment_duration_mode = value.get().expect("type checked upstream");
+            }
+            "max-fragment-duration-diff" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.max_fragment_duration_diff = value.get().expect("type checked upstream");
+            }
             _ => unimplemented!(),
         }
     }
@@ -4552,6 +4642,14 @@ impl ObjectImpl for FMP4Mux {
             "chunk-mode" => {
                 let settings = self.settings.lock().unwrap();
                 settings.chunk_mode.to_value()
+            }
+            "fragment-duration-mode" => {
+                let settings = self.settings.lock().unwrap();
+                settings.fragment_duration_mode.to_value()
+            }
+            "max-fragment-duration-diff" => {
+                let settings = self.settings.lock().unwrap();
+                settings.max_fragment_duration_diff.to_value()
             }
             _ => unimplemented!(),
         }
@@ -4965,7 +5063,7 @@ impl AggregatorImpl for FMP4Mux {
         let mut state = self.state.lock().unwrap();
         let settings = self.settings.lock().unwrap();
         *state = State {
-            sequence_number: settings.start_fragment_sequence_number,
+            sequence_number: settings.start_fragment_sequence_number as u64,
             ..Default::default()
         };
         drop(settings);

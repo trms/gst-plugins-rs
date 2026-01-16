@@ -4891,3 +4891,80 @@ fn fmp4_bayer_roundtrip_rggb16be() {
     init();
     test_fmp4_bayer_roundtrip("rggb16be");
 }
+
+#[test]
+fn test_average_fragment_duration_audio() {
+    init();
+
+    let mut h = gst_check::Harness::new("cmafmux");
+
+    let caps = gst::Caps::builder("audio/mpeg")
+        .field("mpegversion", 4i32)
+        .field("channels", 1i32)
+        .field("rate", 44100i32)
+        .field("stream-format", "raw")
+        .field("base-profile", "lc")
+        .field("profile", "lc")
+        .field("level", "2")
+        .field(
+            "codec_data",
+            gst::Buffer::from_slice([0x12, 0x08, 0x56, 0xe5, 0x00]),
+        )
+        .build();
+
+    // Configures 5s fragment-duration with allowed diff 500ms
+    h.element()
+        .unwrap()
+        .set_property("fragment-duration", 2.seconds());
+    h.element()
+        .unwrap()
+        .set_property("max-fragment-duration-diff", 500.mseconds());
+    h.element()
+        .unwrap()
+        .set_property_from_str("fragment-duration-mode", "average");
+
+    h.set_src_caps(caps);
+    h.play();
+
+    // fragment-duration-mode=average will allow temporary duration overshoot
+    let expected_dur_list: Vec<u64> = vec![
+        6, // 1.8s
+        7, // 2.1s, accumulated dur 3.9s
+        7, // 2.1s, accumulated dur 6s
+        6, // 1.8s, accumulated dur 7.8s
+    ];
+
+    let num_bufs = expected_dur_list.iter().map(|&i| i).sum();
+    for i in 0..num_bufs {
+        let mut buffer = gst::Buffer::with_size(1).unwrap();
+        {
+            let buffer = buffer.get_mut().unwrap();
+            let pos = 300.mseconds() * i;
+            buffer.set_pts(pos);
+            buffer.set_dts(pos);
+            buffer.set_duration(300.mseconds());
+        }
+
+        assert_eq!(h.push(buffer), Ok(gst::FlowSuccess::Ok));
+    }
+
+    h.push_event(gst::event::Eos::new());
+
+    let header = h.pull().unwrap();
+    assert_eq!(
+        header.flags(),
+        gst::BufferFlags::HEADER | gst::BufferFlags::DISCONT
+    );
+    assert_eq!(header.pts(), Some(gst::ClockTime::ZERO));
+
+    for frag in 0..expected_dur_list.len() {
+        let fragment_header = h.pull().unwrap();
+        let expected = expected_dur_list[frag];
+        let expected_dur = 300.mseconds() * expected;
+        assert_eq!(fragment_header.duration(), Some(expected_dur));
+        for _ in 0..expected {
+            let data = h.pull().unwrap();
+            assert_eq!(data.duration(), Some(300.mseconds()));
+        }
+    }
+}
