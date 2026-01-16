@@ -132,6 +132,7 @@ pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
         ChunkMode::static_type().mark_as_plugin_api(gst::PluginAPIFlags::empty());
         MP4Mux::static_type().mark_as_plugin_api(gst::PluginAPIFlags::empty());
         MP4MuxPad::static_type().mark_as_plugin_api(gst::PluginAPIFlags::empty());
+        FragmentDurationMode::static_type().mark_as_plugin_api(gst::PluginAPIFlags::empty());
     }
 
     gst::Element::register(
@@ -734,4 +735,33 @@ pub(crate) struct ChnlLayoutInfo {
     layout_idx: u8, /* Must be u8 for `chnl` box */
     reorder_map: Option<Vec<usize>>,
     omitted_channels_map: u64,
+}
+
+/**
+ * GstFMP4MuxFragmentDurationMode:
+ *
+ * Fragment duration mode
+ */
+#[derive(Debug, Clone, Copy, PartialEq, Eq, glib::Enum)]
+#[enum_type(name = "GstFMP4MuxFragmentDurationMode")]
+pub(crate) enum FragmentDurationMode {
+    /**
+     * GstFMP4MuxFragmentDurationMode:strict:
+     *
+     * Calculate target fragment duration so that it does not larger
+     * than requested fragment duration
+     *
+     * Since: plugins-rs-0.15.0
+     */
+    Strict,
+
+    /**
+     * GstFMP4MuxFragmentDurationMode:average:
+     *
+     * Allow temporary fragment duration overshoot/undershoot so that
+     * average fragment duration can be close to requested fragment duration
+     *
+     * Since: plugins-rs-0.15.0
+     */
+    Average,
 }
