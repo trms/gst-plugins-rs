@@ -72,6 +72,13 @@ impl Default for HlsCmafSinkSettings {
                 gst::ClockTime::from_seconds(DEFAULT_TARGET_DURATION as u64),
             )
             .property("latency", DEFAULT_LATENCY)
+            // Allows temporary overshoot
+            // (but rounded to the nearest integer is not larger than EXT-X-TARGETDURATION)
+            .property(
+                "max-fragment-duration-diff",
+                gst::ClockTime::from_mseconds(450),
+            )
+            .property_from_str("fragment-duration-mode", "average")
             .build()
             .expect("Could not make element cmafmux");
         let appsink = gst_app::AppSink::builder()
