@@ -1145,7 +1145,10 @@ impl Transcriber {
                     )
                 };
 
-                let first_pts = self.state.lock().unwrap().first_buffer_pts.unwrap();
+                let Some(first_pts) = self.state.lock().unwrap().first_buffer_pts else {
+                    gst::debug!(CAT, imp = self, "Discarding message, first_buffer_pts is None (disconnecting)");
+                    return Ok(());
+                };
 
                 match message_type.as_str() {
                     "AddTranslation" => {
