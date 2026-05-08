@@ -843,50 +843,6 @@ impl SignallableImpl for Signaller {
                 }
             }
 
-            imp.obj().connect_closure(
-                "webrtcbin-ready",
-                false,
-                glib::closure!(
-                    #[watch(rename_to = obj)]
-                    imp.obj(),
-                    move |_signaller: &super::LiveKitSignaller,
-                          _consumer_identifier: &str,
-                          webrtcbin: &gst::Element| {
-                        let imp = obj.imp();
-                        gst::info!(CAT, "Adding data channels");
-                        let reliable_channel = webrtcbin
-                            .emit_by_name::<gst_webrtc::WebRTCDataChannel>(
-                                "create-data-channel",
-                                &[
-                                    &"_reliable",
-                                    &gst::Structure::builder("config")
-                                        .field("ordered", true)
-                                        .build(),
-                                ],
-                            );
-                        let lossy_channel = webrtcbin
-                            .emit_by_name::<gst_webrtc::WebRTCDataChannel>(
-                                "create-data-channel",
-                                &[
-                                    &"_lossy",
-                                    &gst::Structure::builder("config")
-                                        .field("ordered", true)
-                                        .field("max-retransmits", 0)
-                                        .build(),
-                                ],
-                            );
-
-                        let mut connection = imp.connection.lock().unwrap();
-                        if let Some(connection) = connection.as_mut() {
-                            connection.channels = Some(Channels {
-                                reliable_channel,
-                                lossy_channel,
-                            });
-                        }
-                    }
-                ),
-            );
-
             if imp.role() == Some(WebRTCSignallerRole::Producer) {
                 imp.obj().emit_by_name::<()>(
                     "session-requested",
