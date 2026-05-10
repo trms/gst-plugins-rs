@@ -39,6 +39,8 @@ const DEFAULT_VOICE_ID: AwsPollyVoiceId = AwsPollyVoiceId::Aria;
 const DEFAULT_SSML_SET_MAX_DURATION: bool = false;
 const DEFAULT_OVERFLOW: AwsOverflow = AwsOverflow::Clip;
 const DEFAULT_MAX_OVERFLOW: gst::ClockTime = gst::ClockTime::from_seconds(0);
+const DEFAULT_COMPRESSION: f64 = 1.0;
+const DEFAULT_MAX_COMPRESSION: f64 = 0.0;
 
 #[derive(Debug, Clone)]
 pub(super) struct Settings {
@@ -53,6 +55,8 @@ pub(super) struct Settings {
     ssml_set_max_duration: bool,
     overflow: AwsOverflow,
     max_overflow: gst::ClockTime,
+    compression: f64,
+    max_compression: f64,
 }
 
 impl Default for Settings {
@@ -69,6 +73,8 @@ impl Default for Settings {
             ssml_set_max_duration: DEFAULT_SSML_SET_MAX_DURATION,
             overflow: DEFAULT_OVERFLOW,
             max_overflow: DEFAULT_MAX_OVERFLOW,
+            compression: DEFAULT_COMPRESSION,
+            max_compression: DEFAULT_MAX_COMPRESSION,
         }
     }
 }
@@ -418,12 +424,31 @@ impl Polly {
 
             gst::debug!(CAT, "Overflow budget: {}", overflow_budget);
 
-            let max_expected_bytes = (input_duration + overflow_budget)
-                .nseconds()
-                .mul_div_floor(32_000, 1_000_000_000)
-                .unwrap()
-                / 2
-                * 2;
+            let compression = self.settings.lock().unwrap().compression;
+
+            let max_expected_bytes = if compression > 1.0 {
+                let target_ns = (input_duration.nseconds() as f64 / compression) as u64;
+                let bytes = target_ns
+                    .mul_div_floor(32_000, 1_000_000_000)
+                    .unwrap()
+                    / 2
+                    * 2;
+                gst::debug!(
+                    CAT,
+                    imp = self,
+                    "compression override active: compression={compression:.3}, \
+                     input_duration={input_duration}, target={target_ns}ns, \
+                     max_expected_bytes={bytes} (overflow_budget={overflow_budget} ignored)"
+                );
+                bytes
+            } else {
+                (input_duration + overflow_budget)
+                    .nseconds()
+                    .mul_div_floor(32_000, 1_000_000_000)
+                    .unwrap()
+                    / 2
+                    * 2
+            };
 
             gst::log!(
                 CAT,
@@ -431,7 +456,24 @@ impl Polly {
             );
 
             if bytes.len() > max_expected_bytes as usize {
-                let factor = bytes.len() as f64 / max_expected_bytes as f64;
+                let max_compression = self.settings.lock().unwrap().max_compression;
+                let raw_factor = bytes.len() as f64 / max_expected_bytes as f64;
+
+                let (factor, effective_max_bytes) =
+                    if max_compression > 1.0 && raw_factor > max_compression {
+                        let new_target =
+                            ((bytes.len() as f64 / max_compression) as u64 / 2) * 2;
+                        gst::debug!(
+                            CAT,
+                            imp = self,
+                            "factor {raw_factor:.3} clamped to max-compression \
+                             {max_compression:.3}; output target {max_expected_bytes} \
+                             -> {new_target} bytes (cue will play longer than source)"
+                        );
+                        (max_compression, new_target)
+                    } else {
+                        (raw_factor, max_expected_bytes)
+                    };
 
                 gst::debug!(
                     CAT,
@@ -448,11 +490,11 @@ impl Polly {
                         (sample as f32) / 32768.
                     })
                     .collect();
-                let mut output = vec![0.0f32; (max_expected_bytes / 2) as usize];
+                let mut output = vec![0.0f32; (effective_max_bytes / 2) as usize];
                 let mut state = self.state.lock().unwrap();
                 state.stretch.as_mut().unwrap().exact(samples, &mut output);
 
-                bytes.truncate(max_expected_bytes as usize);
+                bytes.truncate(effective_max_bytes as usize);
                 let mut bytes_mut: bytes::BytesMut = bytes.into();
 
                 for (out_bytes, sample) in
@@ -988,6 +1030,30 @@ impl ObjectImpl for Polly {
                     .default_value(DEFAULT_MAX_OVERFLOW.mseconds() as u32)
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecDouble::builder("compression")
+                    .nick("Compression")
+                    .blurb("If > 1.0, every cue is compressed so its synthesized output \
+                        fits input_duration / compression. Overrides max-overflow when \
+                        set above 1.0. Used to claw back accumulated drift on languages \
+                        where TTS is consistently denser than source. \
+                        Only used with mode=compress.")
+                    .minimum(1.0)
+                    .maximum(2.0)
+                    .default_value(DEFAULT_COMPRESSION)
+                    .mutable_playing()
+                    .build(),
+                glib::ParamSpecDouble::builder("max-compression")
+                    .nick("Max Compression")
+                    .blurb("Hard cap on the per-cue signalsmith_stretch factor. If the \
+                        natural compression factor (synth_bytes / max_expected_bytes) \
+                        would exceed this value, it is clamped here and the output \
+                        buffer is allowed to play longer than the source span. \
+                        Set to 0.0 (default) for no cap. Only used with mode=compress.")
+                    .minimum(0.0)
+                    .maximum(4.0)
+                    .default_value(DEFAULT_MAX_COMPRESSION)
+                    .mutable_playing()
+                    .build(),
             ]
         });
 
@@ -1056,6 +1122,32 @@ impl ObjectImpl for Polly {
                     value.get::<u32>().expect("type checked upstream").into(),
                 );
             }
+            "compression" => {
+                let mut settings = self.settings.lock().unwrap();
+                let new_value = value.get::<f64>().expect("type checked upstream");
+                if (settings.compression - new_value).abs() > f64::EPSILON {
+                    let old = settings.compression;
+                    gst::info!(
+                        CAT,
+                        imp = self,
+                        "compression {old:.3} -> {new_value:.3}",
+                    );
+                }
+                settings.compression = new_value;
+            }
+            "max-compression" => {
+                let mut settings = self.settings.lock().unwrap();
+                let new_value = value.get::<f64>().expect("type checked upstream");
+                if (settings.max_compression - new_value).abs() > f64::EPSILON {
+                    let old = settings.max_compression;
+                    gst::info!(
+                        CAT,
+                        imp = self,
+                        "max-compression {old:.3} -> {new_value:.3}",
+                    );
+                }
+                settings.max_compression = new_value;
+            }
             _ => unimplemented!(),
         }
     }
@@ -1105,6 +1197,14 @@ impl ObjectImpl for Polly {
             "max-overflow" => {
                 let settings = self.settings.lock().unwrap();
                 (settings.max_overflow.mseconds() as u32).to_value()
+            }
+            "compression" => {
+                let settings = self.settings.lock().unwrap();
+                settings.compression.to_value()
+            }
+            "max-compression" => {
+                let settings = self.settings.lock().unwrap();
+                settings.max_compression.to_value()
             }
             _ => unimplemented!(),
         }
