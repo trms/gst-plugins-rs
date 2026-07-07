@@ -36,6 +36,7 @@ option('isobmff', type: 'feature', value: 'auto', description: 'Build ISO BMFF p
 
 # net
 option('aws', type: 'feature', value: 'auto', description: 'Build aws plugin')
+option('aws-signalsmith_stretch', type: 'feature', value: 'disabled', description: 'Build aws with signalsmith-stretch')
 option('deepgram', type: 'feature', value: 'auto', description: 'Build deepgram plugin')
 option('dashsink2', type: 'feature', value: 'auto', description: 'Build dash plugin')
 option('hlsmultivariantsink', type: 'feature', value: 'auto', description: 'Build hlsmultivariantsink plugin')
@@ -50,8 +51,8 @@ option('rtsp', type: 'feature', value: 'auto', description: 'Build rtsp plugin')
 option('rtp', type: 'feature', value: 'auto', description: 'Build rtp plugin')
 option('udp', type: 'feature', value: 'auto', description: 'Build udp plugin')
 option('webrtc', type: 'feature', value: 'auto', yield: true, description: 'Build webrtc plugin')
-option('webrtc-livekit', type: 'feature', value: 'disabled',  description: 'Build webrtc aws')
-option('webrtc-aws', type: 'feature', value: 'disabled', description: 'Build webrtc livekit')
+option('webrtc-livekit', type: 'feature', value: 'disabled', description: 'Build webrtc livekit')
+option('webrtc-aws', type: 'feature', value: 'disabled', description: 'Build webrtc aws')
 option('webrtcbin2', type: 'feature', value: 'auto', description: 'Build webrtcbin2 plugin')
 option('webrtchttp', type: 'feature', value: 'auto', description: 'Build webrtchttp plugin')
 option('quinn', type: 'feature', value: 'auto', description: 'Build quinn plugin')
