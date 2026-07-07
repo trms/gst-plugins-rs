@@ -113,6 +113,7 @@ plugins = {
   'aws': {
     'library': 'libgstaws',
     'extra-deps': {'openssl': ['>=1.1']},
+    'option-features': ['signalsmith_stretch'],
   },
   'deepgram': {'library': 'libgstdeepgram'},
   'mpegtslive': {'library': 'libgstmpegtslive'},
