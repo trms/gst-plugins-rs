@@ -28,7 +28,9 @@ use atomic_refcell::AtomicRefCell;
 
 use std::sync::LazyLock;
 
-use super::{SpeechmaticsAudioEventType, SpeechmaticsTranscriberDiarization};
+use super::{
+    SpeechmaticsAudioEventType, SpeechmaticsTranscriberDiarization, SpeechmaticsTranscriberModel,
+};
 
 #[derive(serde::Deserialize, Debug)]
 #[allow(dead_code)]
@@ -154,6 +156,26 @@ impl From<SpeechmaticsTranscriberDiarization> for Diarization {
 }
 
 #[derive(serde::Serialize, Debug)]
+#[serde(rename_all = "lowercase")]
+enum Model {
+    Standard,
+    Enhanced,
+    #[serde(rename = "melia-1")]
+    Melia1,
+}
+
+impl From<SpeechmaticsTranscriberModel> for Model {
+    fn from(val: SpeechmaticsTranscriberModel) -> Self {
+        use SpeechmaticsTranscriberModel::*;
+        match val {
+            Standard => Model::Standard,
+            Enhanced => Model::Enhanced,
+            Melia1 => Model::Melia1,
+        }
+    }
+}
+
+#[derive(serde::Serialize, Debug)]
 struct SpeakerDiarizationConfig {
     max_speakers: u32,
     speakers: Vec<LabeledSpeaker>,
@@ -176,12 +198,16 @@ struct TranscriptFilteringConfig {
 struct TranscriptionConfig {
     language: String,
     enable_partials: bool,
-    max_delay: f32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    max_delay: Option<f32>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
     additional_vocab: Vec<Vocable>,
     diarization: Diarization,
     #[serde(skip_serializing_if = "Option::is_none")]
     speaker_diarization_config: Option<SpeakerDiarizationConfig>,
-    transcript_filtering_config: TranscriptFilteringConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    transcript_filtering_config: Option<TranscriptFilteringConfig>,
+    model: Model,
 }
 
 #[derive(serde::Serialize, Debug)]
@@ -228,7 +254,8 @@ struct StartRecognition {
     message: String,
     audio_format: AudioType,
     transcription_config: TranscriptionConfig,
-    translation_config: TranslationConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    translation_config: Option<TranslationConfig>,
     #[serde(skip_serializing_if = "Option::is_none")]
     audio_events_config: Option<AudioEventsConfig>,
 }
@@ -275,6 +302,7 @@ const DEFAULT_REMOVE_DISFLUENCIES: bool = false;
 const DEFAULT_GET_SPEAKERS_INTERVAL: u32 = 0;
 const DEFAULT_AUDIO_EVENT_TYPES: Vec<SpeechmaticsAudioEventType> = vec![];
 const DEFAULT_REPLACEMENTS: Vec<Replacement> = vec![];
+const DEFAULT_MODEL: SpeechmaticsTranscriberModel = SpeechmaticsTranscriberModel::Standard;
 
 #[derive(Debug, Clone)]
 struct Settings {
@@ -293,6 +321,7 @@ struct Settings {
     get_speakers_interval: u32,
     audio_event_types: Vec<SpeechmaticsAudioEventType>,
     replacements: Vec<Replacement>,
+    model: SpeechmaticsTranscriberModel,
 }
 
 impl Default for Settings {
@@ -313,6 +342,7 @@ impl Default for Settings {
             get_speakers_interval: DEFAULT_GET_SPEAKERS_INTERVAL,
             audio_event_types: DEFAULT_AUDIO_EVENT_TYPES,
             replacements: DEFAULT_REPLACEMENTS,
+            model: DEFAULT_MODEL,
         }
     }
 }
@@ -1597,7 +1627,7 @@ impl Transcriber {
                 .unwrap();
 
             let mut messages = vec![];
-            let translation_languages = state
+            let translation_languages: Vec<_> = state
                 .srcpads
                 .iter()
                 .flat_map(|pad| pad.imp().settings.lock().unwrap().language_code.clone())
@@ -1636,18 +1666,34 @@ impl Transcriber {
                         .clone()
                         .unwrap_or_else(|| "en".to_string()),
                     enable_partials: false,
-                    max_delay,
+                    max_delay: if matches!(settings.model, SpeechmaticsTranscriberModel::Melia1) {
+                        None
+                    } else {
+                        Some(max_delay)
+                    },
                     additional_vocab: state.additional_vocabulary.clone(),
                     diarization: settings.diarization.into(),
                     speaker_diarization_config,
-                    transcript_filtering_config: TranscriptFilteringConfig {
-                        remove_disfluencies: settings.remove_disfluencies,
-                        replacements: settings.replacements.clone(),
+                    transcript_filtering_config: if matches!(
+                        settings.model,
+                        SpeechmaticsTranscriberModel::Melia1
+                    ) {
+                        None
+                    } else {
+                        Some(TranscriptFilteringConfig {
+                            remove_disfluencies: settings.remove_disfluencies,
+                            replacements: settings.replacements.clone(),
+                        })
                     },
+                    model: settings.model.into(),
                 },
-                translation_config: TranslationConfig {
-                    target_languages: translation_languages,
-                    enable_partials: false,
+                translation_config: if translation_languages.is_empty() {
+                    None
+                } else {
+                    Some(TranslationConfig {
+                        target_languages: translation_languages,
+                        enable_partials: false,
+                    })
                 },
                 audio_events_config: if settings.audio_event_types.is_empty() {
                     None
@@ -1662,7 +1708,11 @@ impl Transcriber {
                 },
             };
 
-            messages.push(serde_json::to_string(&start_message).unwrap());
+            let start_message = serde_json::to_string(&start_message).unwrap();
+
+            gst::info!(CAT, imp = self, "start message:\n{start_message}");
+
+            messages.push(start_message);
             messages.push(
                 serde_json::to_string(&GetSpeakers {
                     message: "GetSpeakers".to_string(),
@@ -2142,6 +2192,11 @@ impl ObjectImpl for Transcriber {
                     )
                     .mutable_ready()
                     .build(),
+                glib::ParamSpecEnum::builder_with_default("model", DEFAULT_MODEL)
+                    .nick("Model")
+                    .blurb("Selects the model to use")
+                    .mutable_ready()
+                    .build(),
             ]
         });
 
@@ -2382,6 +2437,12 @@ impl ObjectImpl for Transcriber {
                     settings.replacements.push(Replacement { from, to });
                 }
             }
+            "model" => {
+                let mut settings = self.settings.lock().unwrap();
+                settings.model = value
+                    .get::<SpeechmaticsTranscriberModel>()
+                    .expect("type checked upstream");
+            }
             _ => unimplemented!(),
         }
     }
@@ -2498,6 +2559,7 @@ impl ObjectImpl for Transcriber {
                 .map(|x| x.to_send_value())
                 .collect::<gst::Array>()
                 .to_value(),
+            "model" => self.settings.lock().unwrap().model.to_value(),
             _ => unimplemented!(),
         }
     }

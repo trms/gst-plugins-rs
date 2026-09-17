@@ -95,6 +95,19 @@ impl From<SpeechmaticsAudioEventType> for String {
     }
 }
 
+#[derive(Debug, Eq, PartialEq, Ord, PartialOrd, Hash, Clone, Copy, glib::Enum)]
+#[repr(u32)]
+#[enum_type(name = "GstSpeechmaticsTranscriberModel")]
+#[non_exhaustive]
+pub enum SpeechmaticsTranscriberModel {
+    #[enum_value(name = "Standard", nick = "standard")]
+    Standard = 0,
+    #[enum_value(name = "Enhanced", nick = "enhanced")]
+    Enhanced = 1,
+    #[enum_value(name = "Melia-1", nick = "melia-1")]
+    Melia1 = 2,
+}
+
 pub fn register(plugin: &gst::Plugin) -> Result<(), glib::BoolError> {
     #[cfg(feature = "doc")]
     {
