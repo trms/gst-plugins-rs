@@ -149,6 +149,7 @@ plugins = {
   'regex': {'library': 'libgstregex'},
   'textwrap': {'library': 'libgsttextwrap'},
 
+  'avsynctest': { },
   'fallbackswitch': { }, # fallbackswitch can have gtk4 examples, see below
   'livesync': { },     # livesync can have gtk4 examples, see below
   'debugseimetainserter': {

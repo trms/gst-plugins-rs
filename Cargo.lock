@@ -5027,6 +5027,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "gst-plugin-avsynctest"
+version = "0.16.0-alpha"
+dependencies = [
+ "gst-plugin-version-helper",
+ "gstreamer",
+ "gstreamer-app",
+ "gstreamer-audio",
+ "gstreamer-base",
+ "gstreamer-video",
+]
+
+[[package]]
 name = "gst-plugin-aws"
 version = "0.16.0-alpha"
 dependencies = [
