@@ -364,6 +364,12 @@ You will find the following plugins in this repository:
 
   * `utils`
 
+    - `avsynctest`: Elements for measuring audio/video synchronisation:
+      - `avsynctestsrc`: Generates video flashes and audio tones aligned on a
+        common event grid.
+      - `avsyncdetect`: Measures the A/V offset, drift and clock rates from
+        the flashes and tones of `avsynctestsrc` anywhere in a pipeline.
+
     - `debugseimetainserter`: Element to insert SEI metadata into a video stream
       for debugging purposes.
 
